@@ -171,14 +171,15 @@ async function send() {
         history: conversationHistory,
         hits: parseInt(hitsInput.value) || 5,
         k: parseInt(kInput.value) || 3,
-        query_k: parseInt(queryKInput.value) || 3,
-        model: modelInput.value.trim() || null
-      });
-      if(!res.ok || !res.body) {
-        const err = await res.text();
-    assistantText.textContent = `Error: ${err}`;
-    return;
-  }
+        query_k: parseInt(queryKInput.value) || 3
+      })
+    });
+
+    if(!res.ok || !res.body) {
+      const err = await res.text();
+      assistantText.textContent = `Error: ${err}`;
+      return;
+    }
 
     const reader = res.body.getReader();
   const decoder = new TextDecoder();
