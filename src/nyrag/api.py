@@ -76,12 +76,16 @@ def _load_settings() -> Dict[str, Any]:
     if config_path and Path(config_path).exists():
         cfg = Config.from_yaml(config_path)
         rag_params = cfg.rag_params or {}
+        llm_config = cfg.get_llm_config()
         return {
             "app_package_name": cfg.get_app_package_name(),
             "schema_name": cfg.get_schema_name(),
             "embedding_model": rag_params.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
             "vespa_url": vespa_url,
             "vespa_port": vespa_port,
+            "llm_base_url": llm_config.get("llm_base_url"),
+            "llm_model": llm_config.get("llm_model"),
+            "llm_api_key": llm_config.get("llm_api_key"),
         }
 
     return {
@@ -90,6 +94,9 @@ def _load_settings() -> Dict[str, Any]:
         "embedding_model": os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
         "vespa_url": vespa_url,
         "vespa_port": vespa_port,
+        "llm_base_url": None,
+        "llm_model": None,
+        "llm_api_key": None,
     }
 
 
@@ -277,11 +284,26 @@ async def _fetch_chunks_async(query: str, hits: int, k: int) -> List[Dict[str, A
     return await loop.run_in_executor(None, partial(_fetch_chunks, query, hits, k))
 
 
-def _get_openrouter_client() -> AsyncOpenAI:
-    api_key = os.getenv("OPENROUTER_API_KEY")
+def _get_llm_client() -> AsyncOpenAI:
+    """Get LLM client supporting any OpenAI-compatible API (OpenRouter, Ollama, LM Studio, vLLM, etc.)."""
+    # Priority: config file > env vars > defaults (OpenRouter)
+    base_url = (
+        settings.get("llm_base_url")
+        or os.getenv("LLM_BASE_URL")
+        or os.getenv("OPENROUTER_BASE_URL")
+        or "https://openrouter.ai/api/v1"
+    )
+
+    api_key = settings.get("llm_api_key") or os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+
     if not api_key:
-        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY not set")
-    base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        raise HTTPException(
+            status_code=500,
+            detail="LLM API key not set. Set LLM_API_KEY or OPENROUTER_API_KEY environment variable, "
+            "or configure llm_api_key in config file. For local models, use any dummy value.",
+        )
+
+    # OpenRouter-specific headers (ignored by other providers)
     default_headers = {}
     referer = os.getenv("OPENROUTER_REFERRER")
     if referer:
@@ -289,7 +311,65 @@ def _get_openrouter_client() -> AsyncOpenAI:
     title = os.getenv("OPENROUTER_TITLE")
     if title:
         default_headers["X-Title"] = title
+
     return AsyncOpenAI(base_url=base_url, api_key=api_key, default_headers=default_headers or None)
+
+
+async def _create_chat_completion_with_fallback(
+    client: AsyncOpenAI,
+    model: str,
+    messages: List[Dict[str, str]],
+    stream: bool = False,
+    enable_json_mode: bool = False,
+    enable_reasoning: bool = False,
+) -> Any:
+    """
+    Create a chat completion with graceful fallback for unsupported features.
+
+    Tries advanced features first (json_object, reasoning), then falls back to basic mode
+    if the server doesn't support them (e.g., local models like Ollama, LM Studio).
+
+    Args:
+        client: AsyncOpenAI client
+        model: Model name
+        messages: List of message dictionaries
+        stream: Whether to stream responses
+        enable_json_mode: Whether to request JSON output format
+        enable_reasoning: Whether to enable reasoning mode
+
+    Returns:
+        Chat completion response or stream
+    """
+    request_kwargs = {
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    }
+
+    # Add optional features
+    if enable_json_mode:
+        request_kwargs["response_format"] = {"type": "json_object"}
+    if enable_reasoning:
+        request_kwargs["extra_body"] = {"reasoning": {"enabled": True}}
+
+    # Try with all features first
+    if enable_json_mode or enable_reasoning:
+        try:
+            return await client.chat.completions.create(**request_kwargs)
+        except Exception as e:
+            # Check if error is related to unsupported features
+            error_str = str(e).lower()
+            if any(keyword in error_str for keyword in ["response_format", "extra_body", "reasoning", "json_object"]):
+                # Fallback: remove unsupported parameters
+                request_kwargs.pop("response_format", None)
+                request_kwargs.pop("extra_body", None)
+                return await client.chat.completions.create(**request_kwargs)
+            else:
+                # Different error, re-raise
+                raise
+
+    # No special features requested, just make the call
+    return await client.chat.completions.create(**request_kwargs)
 
 
 def _extract_message_text(content: Any) -> str:
@@ -361,16 +441,17 @@ async def _generate_search_queries_stream(
 
     full_content = ""
     try:
-        client = _get_openrouter_client()
-        stream = await client.chat.completions.create(
+        client = _get_llm_client()
+        stream = await _create_chat_completion_with_fallback(
+            client=client,
             model=model_id,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            response_format={"type": "json_object"},
             stream=True,
-            extra_body={"reasoning": {"enabled": True}},
+            enable_json_mode=True,
+            enable_reasoning=True,
         )
 
         async for chunk in stream:
@@ -532,11 +613,13 @@ async def _call_openrouter(context: List[Dict[str, str]], user_message: str, mod
     ]
 
     try:
-        client = _get_openrouter_client()
-        resp = await client.chat.completions.create(
+        client = _get_llm_client()
+        resp = await _create_chat_completion_with_fallback(
+            client=client,
             model=model_id,
             messages=messages,
-            extra_body={"reasoning": {"enabled": True}},
+            stream=False,
+            enable_reasoning=True,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -571,12 +654,13 @@ async def _openrouter_stream(
     )
 
     try:
-        client = _get_openrouter_client()
-        stream = await client.chat.completions.create(
+        client = _get_llm_client()
+        stream = await _create_chat_completion_with_fallback(
+            client=client,
             model=model_id,
             messages=messages,
             stream=True,
-            extra_body={"reasoning": {"enabled": True}},
+            enable_reasoning=True,
         )
 
         async for chunk in stream:
@@ -595,7 +679,7 @@ async def _openrouter_stream(
 
 @app.post("/chat")
 async def chat(req: ChatRequest) -> Dict[str, Any]:
-    model_id = req.model or os.getenv("OPENROUTER_MODEL")
+    model_id = req.model or settings.get("llm_model") or os.getenv("LLM_MODEL") or os.getenv("OPENROUTER_MODEL")
     queries, chunks = await _fuse_chunks(
         await _prepare_queries(req.message, model_id, req.query_k, hits=req.hits, k=req.k),
         hits=req.hits,
@@ -609,7 +693,7 @@ async def chat(req: ChatRequest) -> Dict[str, Any]:
 
 @app.post("/chat-stream")
 async def chat_stream(req: ChatRequest):
-    model_id = req.model or os.getenv("OPENROUTER_MODEL")
+    model_id = req.model or settings.get("llm_model") or os.getenv("LLM_MODEL") or os.getenv("OPENROUTER_MODEL")
 
     async def event_stream():
         yield f"data: {json.dumps({'type': 'status', 'payload': 'Generating search queries...'})}\n\n"
