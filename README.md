@@ -135,8 +135,8 @@ After crawling/processing is complete:
 
 ```bash
 export NYRAG_CONFIG=configs/example.yml
-export OPENROUTER_API_KEY=your-api-key
-export OPENROUTER_MODEL=openai/gpt-5.1
+export LLM_API_KEY=your-api-key
+export LLM_MODEL=openai/gpt-5.1
 
 uvicorn nyrag.api:app --host 0.0.0.0 --port 8000
 ```
@@ -174,8 +174,8 @@ After crawling/processing is complete:
 ```bash
 export NYRAG_CONFIG=configs/example.yml
 export VESPA_URL="https://<your-endpoint>.z.vespa-app.cloud"
-export OPENROUTER_API_KEY=your-api-key
-export OPENROUTER_MODEL=openai/gpt-5.1
+export LLM_API_KEY=your-api-key
+export LLM_MODEL=openai/gpt-5.1
 
 uvicorn nyrag.api:app --host 0.0.0.0 --port 8000
 ```
@@ -255,12 +255,13 @@ Open http://localhost:8000/chat
 |----------|-------------|
 | `NYRAG_CONFIG` | Path to config file |
 | `VESPA_URL` | Vespa endpoint URL (optional for local, required for cloud) |
+| `VESPA_SCHEMA` | Override schema name from config |
+| `EMBEDDING_MODEL` | Override embedding model from config |
 | `LLM_BASE_URL` | LLM API base URL (OpenAI-compatible API) |
 | `LLM_MODEL` | LLM model name |
 | `LLM_API_KEY` | LLM API key |
-| `OPENROUTER_API_KEY` | OpenRouter API key (alternative to `LLM_API_KEY`) |
-| `OPENROUTER_MODEL` | OpenRouter model (alternative to `LLM_MODEL`) |
-| `OPENROUTER_BASE_URL` | OpenRouter base URL (alternative to `LLM_BASE_URL`) |
+
+**Configuration Priority:** Environment variables always take precedence over config file values. When both are set, env vars override the config file.
 
 ---
 
@@ -335,12 +336,6 @@ For access to 100+ models without local setup:
 export LLM_BASE_URL=https://openrouter.ai/api/v1
 export LLM_MODEL=anthropic/claude-3.5-sonnet
 export LLM_API_KEY=your-openrouter-key
-```
-
-Or use the legacy environment variables:
-```bash
-export OPENROUTER_API_KEY=your-key
-export OPENROUTER_MODEL=anthropic/claude-3.5-sonnet
 ```
 
 ---

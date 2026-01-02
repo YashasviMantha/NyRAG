@@ -1,11 +1,13 @@
 import asyncio
 import json
 import os
+import sys
+import tempfile
 from functools import partial
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -13,7 +15,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 
-from nyrag.config import Config
+from nyrag.config import Config, get_config_options, get_example_configs
 from nyrag.logger import get_logger
 from nyrag.utils import (
     DEFAULT_EMBEDDING_MODEL,
@@ -30,12 +32,45 @@ DEFAULT_RANKING = "default"
 DEFAULT_SUMMARY = "top_k_chunks"
 
 
+def _normalize_project_name(name: str) -> str:
+    clean_name = name.replace("-", "").replace("_", "").lower()
+    return f"nyrag{clean_name}"
+
+
+def _resolve_config_path(
+    project_name: Optional[str] = None,
+    config_yaml: Optional[str] = None,
+    active_project: Optional[str] = None,
+) -> Path:
+    if project_name:
+        return Path("output") / project_name / "conf.yml"
+
+    if config_yaml is not None:
+        import yaml
+
+        try:
+            config_data = yaml.safe_load(config_yaml) or {}
+        except yaml.YAMLError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid YAML: {exc}") from exc
+        raw_name = config_data.get("name") or "project"
+        schema_name = _normalize_project_name(str(raw_name))
+        return Path("output") / schema_name / "conf.yml"
+
+    if active_project:
+        return Path("output") / active_project / "conf.yml"
+    raise HTTPException(status_code=400, detail="project_name is required")
+
+
 class SearchRequest(BaseModel):
     query: str = Field(..., description="User query string")
     hits: int = Field(10, description="Number of Vespa hits to return")
     k: int = Field(3, description="Top-k chunks to keep per hit")
     ranking: Optional[str] = Field(None, description="Ranking profile to use (defaults to schema default)")
     summary: Optional[str] = Field(None, description="Document summary to request (defaults to top_k_chunks)")
+
+
+class CrawlRequest(BaseModel):
+    config_yaml: str = Field(..., description="YAML configuration content")
 
 
 def _resolve_mtls_paths(vespa_url: str, project_folder: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -79,18 +114,20 @@ def _load_settings() -> Dict[str, Any]:
         llm_config = cfg.get_llm_config()
         return {
             "app_package_name": cfg.get_app_package_name(),
-            "schema_name": cfg.get_schema_name(),
-            "embedding_model": rag_params.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
+            # Env vars override config file
+            "schema_name": os.getenv("VESPA_SCHEMA") or cfg.get_schema_name(),
+            "embedding_model": os.getenv("EMBEDDING_MODEL")
+            or rag_params.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
             "vespa_url": vespa_url,
             "vespa_port": vespa_port,
-            "llm_base_url": llm_config.get("llm_base_url"),
-            "llm_model": llm_config.get("llm_model"),
-            "llm_api_key": llm_config.get("llm_api_key"),
+            "llm_base_url": os.getenv("LLM_BASE_URL") or llm_config.get("llm_base_url"),
+            "llm_model": os.getenv("LLM_MODEL") or llm_config.get("llm_model"),
+            "llm_api_key": os.getenv("LLM_API_KEY") or llm_config.get("llm_api_key"),
         }
 
     return {
         "app_package_name": None,
-        "schema_name": os.getenv("VESPA_SCHEMA", "nyragwebrag"),
+        "schema_name": os.getenv("VESPA_SCHEMA"),
         "embedding_model": os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
         "vespa_url": vespa_url,
         "vespa_port": vespa_port,
@@ -100,6 +137,146 @@ def _load_settings() -> Dict[str, Any]:
     }
 
 
+def list_available_projects() -> List[str]:
+    """List available projects (folders with conf.yml)."""
+    projects = []
+    output_dir = Path("output")
+    if output_dir.exists():
+        for project_dir in sorted(output_dir.iterdir()):
+            if project_dir.is_dir() and (project_dir / "conf.yml").exists():
+                projects.append(project_dir.name)
+    return projects
+
+
+def load_project_settings(project_name: str) -> Dict[str, Any]:
+    """Load settings from a specific project's conf.yml."""
+    vespa_url = (os.getenv("VESPA_URL") or "").strip() or "http://localhost"
+    vespa_port = resolve_vespa_port(vespa_url)
+
+    config_path = Path("output") / project_name / "conf.yml"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Project config not found: {config_path}")
+
+    cfg = Config.from_yaml(str(config_path))
+    rag_params = cfg.rag_params or {}
+    llm_config = cfg.get_llm_config()
+
+    return {
+        "app_package_name": cfg.get_app_package_name(),
+        # Env vars override config file
+        "schema_name": os.getenv("VESPA_SCHEMA") or cfg.get_schema_name(),
+        "embedding_model": os.getenv("EMBEDDING_MODEL") or rag_params.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
+        "vespa_url": vespa_url,
+        "vespa_port": vespa_port,
+        "llm_base_url": os.getenv("LLM_BASE_URL") or llm_config.get("llm_base_url"),
+        "llm_model": os.getenv("LLM_MODEL") or llm_config.get("llm_model"),
+        "llm_api_key": os.getenv("LLM_API_KEY") or llm_config.get("llm_api_key"),
+    }
+
+
+class CrawlManager:
+    def __init__(self):
+        self.process = None
+        self.subscribers: List[asyncio.Queue] = []
+        self.temp_config_path: Optional[str] = None
+
+    async def start_crawl(self, config_yaml: str):
+        if self.process and self.process.returncode is None:
+            return  # Already running
+
+        # Parse config to get output path and save conf.yml
+        import yaml
+
+        config_data = yaml.safe_load(config_yaml) or {}
+        project_name = config_data.get("name", "project")
+        schema_name = _normalize_project_name(str(project_name))
+        output_dir = Path("output") / schema_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save config to output folder
+        config_path = output_dir / "conf.yml"
+        with open(config_path, "w") as f:
+            f.write(config_yaml)
+        logger.info(f"Config saved to {config_path}")
+
+        # Also create temp file for the subprocess
+        fd, self.temp_config_path = tempfile.mkstemp(suffix=".yml", text=True)
+        with os.fdopen(fd, "w") as f:
+            f.write(config_yaml)
+
+        self.process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "nyrag.cli",
+            "--config",
+            self.temp_config_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        asyncio.create_task(self._read_logs())
+
+    async def _read_logs(self):
+        if not self.process:
+            return
+
+        while True:
+            line = await self.process.stdout.readline()
+            if not line:
+                break
+            decoded_line = line.decode("utf-8").rstrip()
+            # Log to server terminal
+            logger.info(decoded_line)
+            for q in self.subscribers:
+                await q.put(decoded_line)
+
+        await self.process.wait()
+
+        # Cleanup temp file
+        if self.temp_config_path and os.path.exists(self.temp_config_path):
+            try:
+                os.unlink(self.temp_config_path)
+            except OSError:
+                pass
+        self.temp_config_path = None
+
+        # Notify completion
+        for q in self.subscribers:
+            await q.put("EOF")
+
+    async def stop_crawl(self):
+        """Stop the running crawl process."""
+        if self.process and self.process.returncode is None:
+            self.process.terminate()
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                self.process.kill()
+
+            # Notify subscribers
+            for q in self.subscribers:
+                await q.put("EOF")
+
+            return True
+        return False
+
+    async def stream_logs(self):
+        q = asyncio.Queue()
+        self.subscribers.append(q)
+        try:
+            while True:
+                line = await q.get()
+                if line == "EOF":
+                    yield "data: [PROCESS COMPLETED]\n\n"
+                    break
+                yield f"data: {line}\n\n"
+        finally:
+            if q in self.subscribers:
+                self.subscribers.remove(q)
+
+
+crawl_manager = CrawlManager()
+
+active_project: Optional[str] = None
 settings = _load_settings()
 logger = get_logger("api")
 app = FastAPI(title="nyrag API", version="0.1.0")
@@ -121,6 +298,11 @@ vespa_app = make_vespa_client(
 base_dir = Path(__file__).parent
 templates = Jinja2Templates(directory=str(base_dir / "templates"))
 app.mount("/static", StaticFiles(directory=str(base_dir / "static")), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def get(request: Request):
+    return templates.TemplateResponse("chat.html", {"request": request})
 
 
 def _deep_find_numeric_field(obj: Any, key: str) -> Optional[float]:
@@ -185,6 +367,101 @@ async def stats() -> Dict[str, Any]:
         "documents": doc_count,
         "chunks": chunk_count,
     }
+
+
+class ConfigContent(BaseModel):
+    content: str
+
+
+@app.get("/config/options")
+async def get_config_schema(mode: str = "web") -> Dict[str, Any]:
+    """Get the configuration schema options for the frontend."""
+    return get_config_options(mode)
+
+
+@app.get("/config")
+async def get_config(project_name: Optional[str] = None) -> Dict[str, str]:
+    """Get content of the project configuration file."""
+    if not project_name and not active_project:
+        return {"content": ""}
+    config_path = _resolve_config_path(project_name=project_name, active_project=active_project)
+    if not config_path.exists():
+        raise HTTPException(status_code=404, detail=f"Project config not found: {config_path}")
+
+    with open(config_path, "r") as f:
+        return {"content": f.read()}
+
+
+@app.post("/config")
+async def save_config(config: ConfigContent):
+    """Save content to the project configuration file."""
+    config_path = _resolve_config_path(config_yaml=config.content, active_project=active_project)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, "w") as f:
+        f.write(config.content)
+    global active_project
+    active_project = config_path.parent.name
+
+    return {"status": "saved"}
+
+
+@app.get("/config/examples")
+async def list_example_configs() -> Dict[str, str]:
+    """List available example configurations."""
+    return get_example_configs()
+
+
+@app.get("/config/mode")
+async def get_config_mode():
+    """Check if NYRAG_CONFIG env var is set."""
+    config_path = os.getenv("NYRAG_CONFIG")
+    if config_path and Path(config_path).exists():
+        return {"mode": "env_config", "config_path": config_path, "allow_project_selection": False}
+    return {"mode": "project_selection", "config_path": None, "allow_project_selection": True}
+
+
+@app.get("/projects")
+async def get_projects():
+    """List available projects."""
+    config_path = os.getenv("NYRAG_CONFIG")
+    # If NYRAG_CONFIG is set, don't list projects
+    if config_path and Path(config_path).exists():
+        return []
+    return list_available_projects()
+
+
+@app.post("/projects/select")
+async def select_project(project_name: str = Body(..., embed=True)):
+    """Select a project and load its settings."""
+    # If NYRAG_CONFIG is set, don't allow project switching
+    if os.getenv("NYRAG_CONFIG"):
+        raise HTTPException(status_code=403, detail="Project selection disabled when NYRAG_CONFIG is set")
+
+    global active_project, settings
+    try:
+        settings = load_project_settings(project_name)
+        active_project = project_name
+        return {"status": "success", "settings": settings}
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/crawl/start")
+async def start_crawl(req: CrawlRequest):
+    await crawl_manager.start_crawl(req.config_yaml)
+    return {"status": "started"}
+
+
+@app.get("/crawl/logs")
+async def stream_crawl_logs():
+    return StreamingResponse(crawl_manager.stream_logs(), media_type="text/event-stream")
+
+
+@app.post("/crawl/stop")
+async def stop_crawl():
+    """Stop the running crawl process."""
+    stopped = await crawl_manager.stop_crawl()
+    return {"status": "stopped" if stopped else "not_running"}
 
 
 @app.post("/search")
@@ -286,33 +563,37 @@ async def _fetch_chunks_async(query: str, hits: int, k: int) -> List[Dict[str, A
 
 def _get_llm_client() -> AsyncOpenAI:
     """Get LLM client supporting any OpenAI-compatible API (OpenRouter, Ollama, LM Studio, vLLM, etc.)."""
-    # Priority: config file > env vars > defaults (OpenRouter)
-    base_url = (
-        settings.get("llm_base_url")
-        or os.getenv("LLM_BASE_URL")
-        or os.getenv("OPENROUTER_BASE_URL")
-        or "https://openrouter.ai/api/v1"
-    )
+    # Priority: env vars > config file > defaults (OpenRouter)
+    # Note: settings already has env vars applied with higher priority from _load_settings()
+    base_url = settings.get("llm_base_url") or os.getenv("LLM_BASE_URL") or "https://openrouter.ai/api/v1"
 
-    api_key = settings.get("llm_api_key") or os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+    api_key = settings.get("llm_api_key") or os.getenv("LLM_API_KEY")
 
     if not api_key:
         raise HTTPException(
             status_code=500,
-            detail="LLM API key not set. Set LLM_API_KEY or OPENROUTER_API_KEY environment variable, "
+            detail="LLM API key not set. Set LLM_API_KEY environment variable, "
             "or configure llm_api_key in config file. For local models, use any dummy value.",
         )
 
-    # OpenRouter-specific headers (ignored by other providers)
-    default_headers = {}
-    referer = os.getenv("OPENROUTER_REFERRER")
-    if referer:
-        default_headers["HTTP-Referer"] = referer
-    title = os.getenv("OPENROUTER_TITLE")
-    if title:
-        default_headers["X-Title"] = title
+    return AsyncOpenAI(base_url=base_url, api_key=api_key)
 
-    return AsyncOpenAI(base_url=base_url, api_key=api_key, default_headers=default_headers or None)
+
+def _resolve_model_id(request_model: Optional[str]) -> str:
+    # Priority: request param > settings (which has env > config) > env fallback
+    # Note: settings already has LLM_MODEL env var applied with higher priority
+    model_id = (
+        (request_model or "").strip()
+        or (settings.get("llm_model") or "").strip()
+        or (os.getenv("LLM_MODEL") or "").strip()
+    )
+    if not model_id:
+        raise HTTPException(
+            status_code=500,
+            detail="LLM model not set. Set LLM_MODEL env var, configure llm_config.model in the project config, "
+            "or pass model in the request.",
+        )
+    return model_id
 
 
 async def _create_chat_completion_with_fallback(
@@ -359,7 +640,15 @@ async def _create_chat_completion_with_fallback(
         except Exception as e:
             # Check if error is related to unsupported features
             error_str = str(e).lower()
-            if any(keyword in error_str for keyword in ["response_format", "extra_body", "reasoning", "json_object"]):
+            if any(
+                keyword in error_str
+                for keyword in [
+                    "response_format",
+                    "extra_body",
+                    "reasoning",
+                    "json_object",
+                ]
+            ):
                 # Fallback: remove unsupported parameters
                 request_kwargs.pop("response_format", None)
                 request_kwargs.pop("extra_body", None)
@@ -531,6 +820,7 @@ async def _prepare_queries_stream(
 
 
 async def _prepare_queries(user_message: str, model_id: str, query_k: int, hits: int, k: int) -> List[str]:
+    model_id = _resolve_model_id(model_id)
     queries = []
     async for event_type, payload in _prepare_queries_stream(user_message, model_id, query_k, hits, k):
         if event_type == "result":
@@ -597,6 +887,7 @@ async def _fuse_chunks(queries: List[str], hits: int, k: int) -> Tuple[List[Dict
 
 
 async def _call_openrouter(context: List[Dict[str, str]], user_message: str, model_id: str) -> str:
+    model_id = _resolve_model_id(model_id)
     system_prompt = (
         "You are a helpful assistant. "
         "Answer user's question using only the provided context. "
@@ -627,34 +918,79 @@ async def _call_openrouter(context: List[Dict[str, str]], user_message: str, mod
     return _extract_message_text(resp.choices[0].message.content)
 
 
-async def _openrouter_stream(
-    context: List[Dict[str, str]],
-    user_message: str,
-    model_id: str,
-    history: Optional[List[Dict[str, str]]] = None,
-) -> AsyncGenerator[Tuple[str, str], None]:
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    """Chat endpoint supporting retrieval, reasoning, and summarization."""
+    try:
+        return StreamingResponse(_chat_stream(req), media_type="text/event-stream")
+    except Exception as e:
+        logger.error(f"Chat error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _chat_stream(req: ChatRequest):
+    """
+    Stream the chat process using Server-Sent Events (SSE).
+    Events: 'status', 'thinking', 'queries', 'sources', 'thinking_answer', 'answer'
+    """
+
+    def sse(event: str, data: Any) -> str:
+        # Ensure data is JSON serializable
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+    # 1. Expand queries
+    yield sse("status", "Generating search queries...")
+    model_id = _resolve_model_id(req.model)
+    queries = []
+
+    async for event_type, payload in _prepare_queries_stream(
+        req.message, model_id, req.query_k, req.hits, req.k, history=req.history
+    ):
+        if event_type == "thinking":
+            yield sse("thinking", payload)
+        elif event_type == "result":
+            queries = payload
+            yield sse("queries", queries)
+
+    # 2. Retrieve and Fuse
+    yield sse("status", "Retrieving context from Vespa...")
+    used_queries, chunks = await _fuse_chunks(queries, req.hits, req.k)
+    yield sse("sources", chunks)
+
+    if not chunks:
+        yield sse("answer", "No relevant context found.")
+        yield sse("done", None)
+        return
+
+    # 3. Final Generation
+    yield sse("status", "Generating answer...")
     system_prompt = (
-        "You are a helpful assistant. Answer using only the provided context. "
-        "If the context is insufficient, say you don't know."
+        "You are a helpful assistant. "
+        "Answer the user's question using ONLY the provided context chunks. "
+        "If the answer is not in the chunks, say so. "
+        "Do not hallucinate. "
     )
-    context_text = "\n\n".join([f"[{c.get('loc','')}] {c.get('chunk','')}" for c in context])
 
-    messages = [{"role": "system", "content": system_prompt}]
+    context_text = ""
+    for c in chunks:
+        context_text += f"Source: {c.get('loc','')}\nContent: {c.get('chunk','')}\n\n"
 
-    # Add conversation history if provided
-    if history:
-        messages.extend(history)
+    messages = [
+        {"role": "system", "content": system_prompt},
+    ]
+    # Add history
+    for msg in req.history[-4:]:
+        messages.append({"role": msg.get("role"), "content": msg.get("content")})
 
-    # Add current user message with context
     messages.append(
         {
             "role": "user",
-            "content": f"Context:\n{context_text}\n\nQuestion: {user_message}",
+            "content": f"Context:\n{context_text}\n\nQuestion: {req.message}",
         }
     )
 
+    client = _get_llm_client()
     try:
-        client = _get_llm_client()
         stream = await _create_chat_completion_with_fallback(
             client=client,
             model=model_id,
@@ -666,71 +1002,18 @@ async def _openrouter_stream(
         async for chunk in stream:
             choice = chunk.choices[0]
             delta = choice.delta
-            reasoning = _extract_message_text(getattr(delta, "reasoning", None))
-            if reasoning:
-                yield "thinking", reasoning
 
-            content_piece = _extract_message_text(getattr(delta, "content", None))
-            if content_piece:
-                yield "token", content_piece
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+            # Check for reasoning (e.g. DeepSeek R1)
+            reasoning = getattr(delta, "reasoning", None)
+            reasoning_text = _extract_message_text(reasoning)
+            if reasoning_text:
+                yield sse("thinking", reasoning_text)
 
+            content = _extract_message_text(getattr(delta, "content", None))
+            if content:
+                yield sse("answer", content)
 
-@app.post("/chat")
-async def chat(req: ChatRequest) -> Dict[str, Any]:
-    model_id = req.model or settings.get("llm_model") or os.getenv("LLM_MODEL") or os.getenv("OPENROUTER_MODEL")
-    queries, chunks = await _fuse_chunks(
-        await _prepare_queries(req.message, model_id, req.query_k, hits=req.hits, k=req.k),
-        hits=req.hits,
-        k=req.k,
-    )
-    if not chunks:
-        return {"answer": "No relevant context found.", "chunks": []}
-    answer = await _call_openrouter(chunks, req.message, model_id)
-    return {"answer": answer, "chunks": chunks, "queries": queries}
+        yield sse("done", None)
 
-
-@app.post("/chat-stream")
-async def chat_stream(req: ChatRequest):
-    model_id = req.model or settings.get("llm_model") or os.getenv("LLM_MODEL") or os.getenv("OPENROUTER_MODEL")
-
-    async def event_stream():
-        yield f"data: {json.dumps({'type': 'status', 'payload': 'Generating search queries...'})}\n\n"
-
-        queries = []
-        async for event_type, payload in _prepare_queries_stream(
-            req.message,
-            model_id,
-            req.query_k,
-            hits=req.hits,
-            k=req.k,
-            history=req.history,
-        ):
-            if event_type == "thinking":
-                yield f"data: {json.dumps({'type': 'thinking', 'payload': payload})}\n\n"
-            elif event_type == "result":
-                queries = payload
-
-        yield f"data: {json.dumps({'type': 'queries', 'payload': queries})}\n\n"
-        yield f"data: {json.dumps({'type': 'status', 'payload': 'Retrieving context from Vespa...'})}\n\n"
-        queries, chunks = await _fuse_chunks(queries, hits=req.hits, k=req.k)
-        yield f"data: {json.dumps({'type': 'chunks', 'payload': chunks})}\n\n"
-        if not chunks:
-            yield f"data: {json.dumps({'type': 'done', 'payload': 'No relevant context found.'})}\n\n"
-            return
-        yield f"data: {json.dumps({'type': 'status', 'payload': 'Generating answer...'})}\n\n"
-        async for type_, payload in _openrouter_stream(chunks, req.message, model_id, req.history):
-            yield f"data: {json.dumps({'type': type_, 'payload': payload})}\n\n"
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream; charset=utf-8",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-    )
-
-
-@app.get("/", response_class=HTMLResponse)
-async def chat_ui(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse("chat.html", {"request": request})
+    except Exception as e:
+        yield sse("error", str(e))
