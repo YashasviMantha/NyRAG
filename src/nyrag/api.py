@@ -217,6 +217,7 @@ class CrawlManager:
             sys.executable,
             "-m",
             "nyrag.cli",
+            "process",
             "--config",
             self.temp_config_path,
             stdout=asyncio.subprocess.PIPE,

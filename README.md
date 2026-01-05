@@ -74,7 +74,7 @@ Runs Vespa in a local Docker container. Great for development and testing.
 ```bash
 export NYRAG_LOCAL=1
 
-nyrag --config configs/example.yml
+nyrag process --config configs/example.yml
 ```
 
 Example config for web crawling:
@@ -103,7 +103,7 @@ rag_params:
 ```bash
 export NYRAG_LOCAL=1
 
-nyrag --config configs/doc_example.yml
+nyrag process --config configs/doc_example.yml
 ```
 
 Example config for document processing:
@@ -138,7 +138,7 @@ export NYRAG_CONFIG=configs/example.yml
 export LLM_API_KEY=your-api-key
 export LLM_MODEL=openai/gpt-5.1
 
-uvicorn nyrag.api:app --host 0.0.0.0 --port 8000
+nyrag ui
 ```
 
 Open http://localhost:8000/chat
@@ -155,7 +155,7 @@ Deploys to Vespa Cloud for production use.
 export NYRAG_LOCAL=0
 export VESPA_CLOUD_TENANT=your-tenant
 
-nyrag --config configs/example.yml
+nyrag process --config configs/example.yml
 ```
 
 ### Document Processing (Cloud)
@@ -164,7 +164,7 @@ nyrag --config configs/example.yml
 export NYRAG_LOCAL=0
 export VESPA_CLOUD_TENANT=your-tenant
 
-nyrag --config configs/doc_example.yml
+nyrag process --config configs/doc_example.yml
 ```
 
 ### Chat UI (Cloud)
@@ -177,7 +177,7 @@ export VESPA_URL="https://<your-endpoint>.z.vespa-app.cloud"
 export LLM_API_KEY=your-api-key
 export LLM_MODEL=openai/gpt-5.1
 
-uvicorn nyrag.api:app --host 0.0.0.0 --port 8000
+nyrag ui
 ```
 
 Open http://localhost:8000/chat
@@ -295,7 +295,7 @@ NyRAG supports running LLMs locally using any OpenAI-compatible server. Here are
 
 5. **Start the chat UI**:
    ```bash
-   nyrag-api
+   nyrag ui
    ```
 
 ### LM Studio

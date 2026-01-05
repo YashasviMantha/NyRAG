@@ -17,8 +17,7 @@ saveBtn.onclick = () => modal.style.display = "none";
 const crawlBtn = document.getElementById("crawl-btn");
 const crawlModal = document.getElementById("crawl-modal");
 const closeCrawlBtn = crawlModal.querySelector(".close-crawl-btn");
-const startCrawlBtn = document.getElementById("start-crawl-btn");
-const stopCrawlBtn = document.getElementById("stop-crawl-btn");
+const crawlActionBtn = document.getElementById("crawl-action-btn");
 const terminalLogs = document.getElementById("terminal-logs");
 const terminalStatus = document.getElementById("terminal-status");
 const yamlContainer = document.getElementById("interactive-yaml-container");
@@ -368,7 +367,42 @@ window.onclick = (e) => {
   if (e.target == crawlModal) crawlModal.style.display = "none";
 };
 
-startCrawlBtn.onclick = async () => {
+function updateCrawlButton(isRunning) {
+  if (isRunning) {
+    crawlActionBtn.textContent = "Stop Crawl";
+    crawlActionBtn.classList.remove("primary-btn");
+    crawlActionBtn.classList.add("secondary-btn");
+    crawlActionBtn.style.backgroundColor = "#ef4444"; // Make it red for stop
+    crawlActionBtn.style.color = "white";
+  } else {
+    crawlActionBtn.textContent = "Start Crawl Process";
+    crawlActionBtn.classList.remove("secondary-btn");
+    crawlActionBtn.classList.add("primary-btn");
+    crawlActionBtn.style.backgroundColor = ""; // Reset to default
+    crawlActionBtn.style.color = "";
+  }
+}
+
+crawlActionBtn.onclick = async () => {
+  if (currentEventSource) {
+    // STOPPING
+    try {
+      await fetch("/crawl/stop", { method: "POST" });
+      if (currentEventSource) {
+        currentEventSource.close();
+        currentEventSource = null;
+      }
+      terminalLogs.textContent += "\n[Crawl stopped by user]\n";
+      terminalStatus.textContent = "Stopped";
+      terminalStatus.style.color = "#f59e0b"; // Orange
+      updateCrawlButton(false);
+    } catch (e) {
+      console.error("Failed to stop crawl", e);
+    }
+    return;
+  }
+
+  // STARTING
   terminalLogs.textContent = "";
   terminalStatus.textContent = "Saving...";
   terminalStatus.style.color = "#fbbf24"; // Amber
@@ -400,6 +434,7 @@ startCrawlBtn.onclick = async () => {
 
     // 3. Connect to log stream using EventSource (SSE)
     currentEventSource = new EventSource("/crawl/logs");
+    updateCrawlButton(true);
 
     currentEventSource.onmessage = (event) => {
       if (event.data === "[PROCESS COMPLETED]") {
@@ -407,6 +442,7 @@ startCrawlBtn.onclick = async () => {
         currentEventSource = null;
         terminalStatus.textContent = "Completed";
         terminalStatus.style.color = "#10b981";
+        updateCrawlButton(false);
         return;
       }
       terminalLogs.textContent += event.data + "\n";
@@ -420,28 +456,14 @@ startCrawlBtn.onclick = async () => {
         terminalStatus.textContent = "Completed";
         terminalStatus.style.color = "#10b981";
       }
+      updateCrawlButton(false);
     };
 
   } catch (e) {
     terminalLogs.textContent += `Connection error: ${e.message}\n`;
     terminalStatus.textContent = "Error";
     terminalStatus.style.color = "#ef4444";
-  }
-};
-
-// Stop Crawl Button
-stopCrawlBtn.onclick = async () => {
-  try {
-    await fetch("/crawl/stop", { method: "POST" });
-    if (currentEventSource) {
-      currentEventSource.close();
-      currentEventSource = null;
-    }
-    terminalLogs.textContent += "\n[Crawl stopped by user]\n";
-    terminalStatus.textContent = "Stopped";
-    terminalStatus.style.color = "#f59e0b"; // Orange
-  } catch (e) {
-    console.error("Failed to stop crawl", e);
+    updateCrawlButton(false);
   }
 };
 
