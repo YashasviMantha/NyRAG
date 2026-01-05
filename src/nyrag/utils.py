@@ -60,7 +60,11 @@ def get_tls_config_from_deploy(
         key = os.getenv("VESPA_CLIENT_KEY")
         ca = os.getenv("VESPA_CA_CERT")
         verify_str = os.getenv("VESPA_TLS_VERIFY")
-        verify = verify_str.strip().lower() in ("1", "true", "yes") if verify_str else DEFAULT_VESPA_TLS_VERIFY
+        verify = (
+            verify_str.strip().lower() in ("1", "true", "yes")
+            if verify_str
+            else DEFAULT_VESPA_TLS_VERIFY
+        )
         return cert, key, ca, verify
 
     return (

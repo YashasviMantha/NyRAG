@@ -45,7 +45,9 @@ def _confirm_cluster_removal(message: str, *, until: date) -> bool:
     - Otherwise, ask the user.
     """
     if not sys.stdin.isatty():
-        logger.warning("Vespa deploy requires 'content-cluster-removal' override, but stdin is not interactive.")
+        logger.warning(
+            "Vespa deploy requires 'content-cluster-removal' override, but stdin is not interactive."
+        )
         return False
 
     console.print(
@@ -67,7 +69,9 @@ def _write_validation_overrides(app_dir: Path, *, until: date) -> None:
     )
 
 
-def _deploy_with_pyvespa(deployer: Any, *, application_package: ApplicationPackage, application_root: Path) -> Any:
+def _deploy_with_pyvespa(
+    deployer: Any, *, application_package: ApplicationPackage, application_root: Path
+) -> Any:
     """
     Deploy using pyvespa across minor API differences.
 
@@ -183,7 +187,9 @@ def deploy_app_package(
                     cfgsrv_url = deploy_config.get_configserver_url()
                     logger.info(f"Deploying via compose config server at {cfgsrv_url}")
                 else:
-                    logger.info(f"Deploying with VespaDocker (image={DEFAULT_VESPA_DOCKER_IMAGE})")
+                    logger.info(
+                        f"Deploying with VespaDocker (image={DEFAULT_VESPA_DOCKER_IMAGE})"
+                    )
 
                 import inspect
 
@@ -226,8 +232,12 @@ def deploy_app_package(
                 instance = deploy_config.get_cloud_instance()
 
                 if not deploy_config.get_cloud_application():
-                    logger.info(f"VESPA_CLOUD_APPLICATION not set; using generated app name '{application}'")
-                logger.info(f"Deploying to Vespa Cloud: {tenant}/{application}/{instance}")
+                    logger.info(
+                        f"VESPA_CLOUD_APPLICATION not set; using generated app name '{application}'"
+                    )
+                logger.info(
+                    f"Deploying to Vespa Cloud: {tenant}/{application}/{instance}"
+                )
 
                 import inspect
 
