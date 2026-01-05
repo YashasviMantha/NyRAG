@@ -65,15 +65,21 @@ class SearchRequest(BaseModel):
     query: str = Field(..., description="User query string")
     hits: int = Field(10, description="Number of Vespa hits to return")
     k: int = Field(3, description="Top-k chunks to keep per hit")
-    ranking: Optional[str] = Field(None, description="Ranking profile to use (defaults to schema default)")
-    summary: Optional[str] = Field(None, description="Document summary to request (defaults to top_k_chunks)")
+    ranking: Optional[str] = Field(
+        None, description="Ranking profile to use (defaults to schema default)"
+    )
+    summary: Optional[str] = Field(
+        None, description="Document summary to request (defaults to top_k_chunks)"
+    )
 
 
 class CrawlRequest(BaseModel):
     config_yaml: str = Field(..., description="YAML configuration content")
 
 
-def _resolve_mtls_paths(vespa_url: str, project_folder: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+def _resolve_mtls_paths(
+    vespa_url: str, project_folder: Optional[str]
+) -> Tuple[Optional[str], Optional[str]]:
     cert_env = (os.getenv("VESPA_CLIENT_CERT") or "").strip() or None
     key_env = (os.getenv("VESPA_CLIENT_KEY") or "").strip() or None
 
@@ -82,7 +88,9 @@ def _resolve_mtls_paths(vespa_url: str, project_folder: Optional[str]) -> Tuple[
 
     if cert_env or key_env:
         if not (cert_env and key_env):
-            raise RuntimeError("Vespa Cloud requires both VESPA_CLIENT_CERT and VESPA_CLIENT_KEY.")
+            raise RuntimeError(
+                "Vespa Cloud requires both VESPA_CLIENT_CERT and VESPA_CLIENT_KEY."
+            )
         return cert_env, key_env
 
     if not project_folder:
@@ -165,7 +173,8 @@ def load_project_settings(project_name: str) -> Dict[str, Any]:
         "app_package_name": cfg.get_app_package_name(),
         # Env vars override config file
         "schema_name": os.getenv("VESPA_SCHEMA") or cfg.get_schema_name(),
-        "embedding_model": os.getenv("EMBEDDING_MODEL") or rag_params.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
+        "embedding_model": os.getenv("EMBEDDING_MODEL")
+        or rag_params.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
         "vespa_url": vespa_url,
         "vespa_port": vespa_port,
         "llm_base_url": os.getenv("LLM_BASE_URL") or llm_config.get("llm_base_url"),
@@ -283,7 +292,9 @@ app = FastAPI(title="nyrag API", version="0.1.0")
 model = SentenceTransformer(settings["embedding_model"])
 
 # Get mTLS credentials (with Vespa Cloud fallback)
-_cert, _key = _resolve_mtls_paths(settings["vespa_url"], settings.get("app_package_name"))
+_cert, _key = _resolve_mtls_paths(
+    settings["vespa_url"], settings.get("app_package_name")
+)
 _, _, _ca, _verify = get_vespa_tls_config()
 
 vespa_app = make_vespa_client(
@@ -349,7 +360,10 @@ async def stats() -> Dict[str, Any]:
 
     try:
         # Requires schema field `chunk_count` (added in this repo); if absent, this will likely return null.
-        yql = "select * from sources * where true | " "all(group(1) each(output(count(), sum(chunk_count))))"
+        yql = (
+            "select * from sources * where true | "
+            "all(group(1) each(output(count(), sum(chunk_count))))"
+        )
         res = vespa_app.query(
             body={"yql": yql, "hits": 0},
             schema=settings["schema_name"],
@@ -384,9 +398,13 @@ async def get_config(project_name: Optional[str] = None) -> Dict[str, str]:
     """Get content of the project configuration file."""
     if not project_name and not active_project:
         return {"content": ""}
-    config_path = _resolve_config_path(project_name=project_name, active_project=active_project)
+    config_path = _resolve_config_path(
+        project_name=project_name, active_project=active_project
+    )
     if not config_path.exists():
-        raise HTTPException(status_code=404, detail=f"Project config not found: {config_path}")
+        raise HTTPException(
+            status_code=404, detail=f"Project config not found: {config_path}"
+        )
 
     with open(config_path, "r") as f:
         return {"content": f.read()}
@@ -396,7 +414,9 @@ async def get_config(project_name: Optional[str] = None) -> Dict[str, str]:
 async def save_config(config: ConfigContent):
     """Save content to the project configuration file."""
     global active_project
-    config_path = _resolve_config_path(config_yaml=config.content, active_project=active_project)
+    config_path = _resolve_config_path(
+        config_yaml=config.content, active_project=active_project
+    )
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with open(config_path, "w") as f:
         f.write(config.content)
@@ -407,7 +427,7 @@ async def save_config(config: ConfigContent):
 
 @app.get("/config/examples")
 async def list_example_configs() -> Dict[str, str]:
-    """List available example configurations."""
+    """List available template configurations."""
     return get_example_configs()
 
 
@@ -416,8 +436,16 @@ async def get_config_mode():
     """Check if NYRAG_CONFIG env var is set."""
     config_path = os.getenv("NYRAG_CONFIG")
     if config_path and Path(config_path).exists():
-        return {"mode": "env_config", "config_path": config_path, "allow_project_selection": False}
-    return {"mode": "project_selection", "config_path": None, "allow_project_selection": True}
+        return {
+            "mode": "env_config",
+            "config_path": config_path,
+            "allow_project_selection": False,
+        }
+    return {
+        "mode": "project_selection",
+        "config_path": None,
+        "allow_project_selection": True,
+    }
 
 
 @app.get("/projects")
@@ -435,7 +463,10 @@ async def select_project(project_name: str = Body(..., embed=True)):
     """Select a project and load its settings."""
     # If NYRAG_CONFIG is set, don't allow project switching
     if os.getenv("NYRAG_CONFIG"):
-        raise HTTPException(status_code=403, detail="Project selection disabled when NYRAG_CONFIG is set")
+        raise HTTPException(
+            status_code=403,
+            detail="Project selection disabled when NYRAG_CONFIG is set",
+        )
 
     global active_project, settings
     try:
@@ -454,7 +485,9 @@ async def start_crawl(req: CrawlRequest):
 
 @app.get("/crawl/logs")
 async def stream_crawl_logs():
-    return StreamingResponse(crawl_manager.stream_logs(), media_type="text/event-stream")
+    return StreamingResponse(
+        crawl_manager.stream_logs(), media_type="text/event-stream"
+    )
 
 
 @app.post("/crawl/stop")
@@ -500,7 +533,9 @@ class ChatRequest(BaseModel):
         ge=0,
         description="Number of alternate search queries to generate with the LLM",
     )
-    model: Optional[str] = Field(None, description="OpenRouter model id (optional, uses env default if set)")
+    model: Optional[str] = Field(
+        None, description="OpenRouter model id (optional, uses env default if set)"
+    )
 
 
 def _fetch_chunks(query: str, hits: int, k: int) -> List[Dict[str, Any]]:
@@ -534,7 +569,10 @@ def _fetch_chunks(query: str, hits: int, k: int) -> List[Dict[str, Any]]:
         except (TypeError, ValueError):
             hit_score = 0.0
         summary_features = (
-            hit.get("summaryfeatures") or hit.get("summaryFeatures") or fields.get("summaryfeatures") or {}
+            hit.get("summaryfeatures")
+            or hit.get("summaryFeatures")
+            or fields.get("summaryfeatures")
+            or {}
         )
         chunk_score_raw = summary_features.get("best_chunk_score", hit_score)
         logger.info(f"  best_chunk_score={chunk_score_raw}")
@@ -565,7 +603,11 @@ def _get_llm_client() -> AsyncOpenAI:
     """Get LLM client supporting any OpenAI-compatible API (OpenRouter, Ollama, LM Studio, vLLM, etc.)."""
     # Priority: env vars > config file > defaults (OpenRouter)
     # Note: settings already has env vars applied with higher priority from _load_settings()
-    base_url = settings.get("llm_base_url") or os.getenv("LLM_BASE_URL") or "https://openrouter.ai/api/v1"
+    base_url = (
+        settings.get("llm_base_url")
+        or os.getenv("LLM_BASE_URL")
+        or "https://openrouter.ai/api/v1"
+    )
 
     api_key = settings.get("llm_api_key") or os.getenv("LLM_API_KEY")
 
@@ -698,7 +740,9 @@ async def _generate_search_queries_stream(
         return
 
     grounding_chunks = (await _fetch_chunks_async(user_message, hits=hits, k=k))[:5]
-    grounding_text = "\n".join(f"- [{c.get('loc','')}] {c.get('chunk','')}" for c in grounding_chunks)
+    grounding_text = "\n".join(
+        f"- [{c.get('loc','')}] {c.get('chunk','')}" for c in grounding_chunks
+    )
 
     system_prompt = (
         "You generate concise, to-the-point search queries that help retrieve"
@@ -819,16 +863,22 @@ async def _prepare_queries_stream(
     yield "result", deduped
 
 
-async def _prepare_queries(user_message: str, model_id: str, query_k: int, hits: int, k: int) -> List[str]:
+async def _prepare_queries(
+    user_message: str, model_id: str, query_k: int, hits: int, k: int
+) -> List[str]:
     model_id = _resolve_model_id(model_id)
     queries = []
-    async for event_type, payload in _prepare_queries_stream(user_message, model_id, query_k, hits, k):
+    async for event_type, payload in _prepare_queries_stream(
+        user_message, model_id, query_k, hits, k
+    ):
         if event_type == "result":
             queries = payload
     return queries
 
 
-async def _fuse_chunks(queries: List[str], hits: int, k: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+async def _fuse_chunks(
+    queries: List[str], hits: int, k: int
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Search Vespa for each query and return fused, deduped chunks."""
     all_chunks: List[Dict[str, Any]] = []
     logger.info(f"Fetching chunks for {len(queries)} queries")
@@ -886,7 +936,9 @@ async def _fuse_chunks(queries: List[str], hits: int, k: int) -> Tuple[List[Dict
     return queries, fused
 
 
-async def _call_openrouter(context: List[Dict[str, str]], user_message: str, model_id: str) -> str:
+async def _call_openrouter(
+    context: List[Dict[str, str]], user_message: str, model_id: str
+) -> str:
     model_id = _resolve_model_id(model_id)
     system_prompt = (
         "You are a helpful assistant. "
@@ -894,7 +946,9 @@ async def _call_openrouter(context: List[Dict[str, str]], user_message: str, mod
         "Provide elaborate and informative answers where possible. "
         "If the context is insufficient, say you don't know."
     )
-    context_text = "\n\n".join([f"[{c.get('loc','')}] {c.get('chunk','')}" for c in context])
+    context_text = "\n\n".join(
+        [f"[{c.get('loc','')}] {c.get('chunk','')}" for c in context]
+    )
     messages = [
         {"role": "system", "content": system_prompt},
         {

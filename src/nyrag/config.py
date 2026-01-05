@@ -149,7 +149,10 @@ def get_config_options(mode: str = "web") -> Dict[str, Any]:
             "type": "nested",
             "label": "crawl_params",
             "fields": {
-                "respect_robots_txt": {"type": "boolean", "label": "respect_robots_txt"},
+                "respect_robots_txt": {
+                    "type": "boolean",
+                    "label": "respect_robots_txt",
+                },
                 "follow_subdomains": {"type": "boolean", "label": "follow_subdomains"},
                 "user_agent_type": {
                     "type": "select",
@@ -210,7 +213,7 @@ def get_config_options(mode: str = "web") -> Dict[str, Any]:
 
 def get_example_configs() -> Dict[str, str]:
     """
-    Return available example configurations from the package.
+    Return available template configurations from the package.
     Returns a dict of {name: yaml_content}.
     """
     import importlib.resources as pkg_resources

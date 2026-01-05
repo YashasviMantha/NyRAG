@@ -316,15 +316,22 @@ async function loadExamples() {
     exampleConfigs = await res.json();
 
     // Populate dropdown
-    exampleSelect.innerHTML = '<option value="">-- Select an example --</option>';
+    exampleSelect.innerHTML = '<option value="">-- Select a template --</option>';
     Object.keys(exampleConfigs).forEach(name => {
       const opt = document.createElement("option");
       opt.value = name;
       opt.textContent = name;
       exampleSelect.appendChild(opt);
     });
+
+    // Auto-select "web" template if available
+    if (exampleConfigs["web"]) {
+      exampleSelect.value = "web";
+      // Trigger the onchange event
+      exampleSelect.dispatchEvent(new Event('change'));
+    }
   } catch (e) {
-    console.error("Failed to load examples", e);
+    console.error("Failed to load templates", e);
   }
 }
 
